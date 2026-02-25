@@ -8,10 +8,6 @@
         "url": "https://github.com/Gio1112"
     },
     "main": "index.js",
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/Gio1112"
-    },
     "keywords": [
         "railway",
         "osm",
@@ -21,4 +17,5 @@
     ],
     "subwayBuilderVersion": "1.0.0",
     "changelog": "v2.0: Texture-based visual effects, performance improvements, GitHub installation"
+
 }
