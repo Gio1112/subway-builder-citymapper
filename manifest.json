@@ -8,14 +8,8 @@
         "url": "https://github.com/Gio1112"
     },
     "main": "index.js",
-    "keywords": [
-        "railway",
-        "osm",
-        "overlay",
-        "railway-lines",
-        "cities"
-    ],
     "subwayBuilderVersion": "1.0.0",
     "changelog": "v2.0: Texture-based visual effects, performance improvements, GitHub installation"
 
 }
+
