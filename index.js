@@ -1,4 +1,4 @@
-﻿(function() {
+(function() {
     'use strict';
     
     const api = window.SubwayBuilderAPI;
@@ -18,7 +18,6 @@
     let overlayEnabled = true;
     let showLabels = false;
     let isLoading = false;
-    let hasDownloadedForCity = new Set();
     let lastLoadedData = null;
     let pendingCityLoad = null;
     let mapReady = false;
@@ -29,6 +28,10 @@
     let stationPopup = null;
     const stationPopupHandlers = new Set();
     let stationTooltipEl = null;
+
+    // Fast lookup: IDs of all map layers this mod has added for the current city.
+    // Avoids scanning the full style.layers array on every toggle/reorder.
+    const ownLayerIds = new Set();
 
     // DIAGNOSTICS STATE
     const diagnostics = {
@@ -126,8 +129,6 @@
     };
     
     // File system access is restricted in this environment
-    let useFileSystem = false;
-    
     // We will use IndexedDB for persistence
     console.log('[Railway Overlay] initialized. Persistence via IndexedDB');
     
@@ -212,14 +213,6 @@
             }
         }
     };
-
-    let cacheData = {};
-    let cacheVersion = 0;
-    
-    // Load city data from storage
-    async function loadCityData(cityCode) {
-        return await loadFromCache(cityCode);
-    }
 
     async function loadFromCache(cityCode) {
         try {
@@ -311,18 +304,12 @@
                 api.ui.showNotification(`No data found for ${cityName}. Please use the bottom panel to import.`, 'info');
                 return null;
             }
-            
-            return null;
         } catch (error) {
             api.ui.showNotification(`DEBUG ERROR: ${error.message}`, 'error');
             return null;
         }
     }
     
-    async function downloadFromOSM(cityCode, cityName, cityData) {
-        return null;
-    }
-
     function resolveAssetUrls(filename) {
         const urls = [];
 
@@ -401,10 +388,7 @@
             }
         };
 
-        await loadOne('tunnel');
-        await loadOne('bridge');
-        await loadOne('abandoned');
-        await loadOne('bridgeDetail');
+        await Promise.all(['tunnel', 'bridge', 'abandoned', 'bridgeDetail'].map(loadOne));
 
         textureState.loaded = true;
         textureState.loading = false;
@@ -514,10 +498,9 @@
         });
         
         const nodes = new Map();
-        let nodeCount = 0;
-        let wayCount = 0;
-        let railwayWayCount = 0;
-        
+        // Collect station nodes during the first pass so we don't need a
+        // separate full-map scan at the end.
+        const stationNodes = [];
         const chunkSize = 10000;
         const totalElements = osmData.elements.length;
         
@@ -528,7 +511,9 @@
                 const el = osmData.elements[j];
                 if (el.type === 'node') {
                     nodes.set(el.id, { lat: el.lat, lon: el.lon, tags: el.tags || {} });
-                    nodeCount++;
+                    if (el.tags?.railway && ['station', 'halt', 'stop'].includes(el.tags.railway)) {
+                        stationNodes.push(el);
+                    }
                 }
             }
             await new Promise(resolve => setTimeout(resolve, 0));
@@ -541,15 +526,12 @@
                 const element = osmData.elements[j];
                 
                 if (element.type === 'way' && element.nodes && element.nodes.length > 0) {
-                    wayCount++;
                     let railway = element.tags?.railway;
                     if (!railway && element.tags?.public_transport === 'platform') {
                         railway = 'platform';
                     }
-                    if (!railway) continue; 
-                    
-                    railwayWayCount++;
-                    
+                    if (!railway) continue;
+
                     const coords = [];
                     for (const nodeId of element.nodes) {
                         const node = nodes.get(nodeId);
@@ -592,37 +574,28 @@
                     }
                 }
             }
-            if (i % (chunkSize * 2) === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
         
-        nodes.forEach((node, id) => {
-            if (node.tags.railway && ['station', 'halt', 'stop'].includes(node.tags.railway)) {
-                const lineInfo = node.tags.line || 
-                                node.tags.lines || 
-                                node.tags['subway:line'] || 
-                                node.tags['train:line'] || 
-                                node.tags['tram:line'] || 
-                                node.tags.ref ||
-                                '';
-                
-                stations.push({
-                    type: 'Feature',
-                    properties: {
-                        name: node.tags.name || 'Station',
-                        railway: node.tags.railway,
-                        network: node.tags.network || '',
-                        operator: node.tags.operator || '',
-                        line: lineInfo,
-                        ref: node.tags.ref || '',
-                        platforms: node.tags.platforms || node.tags['public_transport:platforms'] || ''
-                    },
-                    geometry: {
-                        type: 'Point',
-                        coordinates: [node.lon, node.lat]
-                    }
-                });
-            }
-        });
+        for (const node of stationNodes) {
+            const tags = node.tags;
+            const lineInfo = tags.line || tags.lines ||
+                             tags['subway:line'] || tags['train:line'] ||
+                             tags['tram:line'] || tags.ref || '';
+            stations.push({
+                type: 'Feature',
+                properties: {
+                    name: tags.name || 'Station',
+                    railway: tags.railway,
+                    network: tags.network || '',
+                    operator: tags.operator || '',
+                    line: lineInfo,
+                    ref: tags.ref || '',
+                    platforms: tags.platforms || tags['public_transport:platforms'] || ''
+                },
+                geometry: { type: 'Point', coordinates: [node.lon, node.lat] }
+            });
+        }
         
         return { layerData, stations };
     }
@@ -633,26 +606,18 @@
         }
         
         isLoading = true;
+        try {
         currentCity = cityCode;
         
         const map = api.utils.getMap();
-        if (!map) {
-            isLoading = false;
-            return;
-        }
+        if (!map) return;
 
         const style = map.getStyle();
-        if (!style || !style.layers) {
-            isLoading = false;
-            return;
-        }
+        if (!style || !style.layers) return;
         
         const data = await fetchRailwayData(cityCode, forceRefresh);
         
-        if (!data) {
-            isLoading = false;
-            return;
-        }
+        if (!data) return;
         
         const { layerData, stations } = data;
 
@@ -660,19 +625,20 @@
         
         lastLoadedData = { layerData, stations, cityCode };
         lastLoadedData.sampleLayerId = getSampleLayerId(layerData, cityCode);
+        ownLayerIds.clear();
         
         removeExistingLayers(cityCode);
-        
-        const layers = style.layers;
-        const insertBeforeId = getLabelInsertId(style);
+
+        // Re-snapshot style after removal so existingSources/existingLayers reflect current map state
+        const currentStyle = map.getStyle();
+        const insertBeforeId = getLabelInsertId(currentStyle);
         
         let totalFeatures = 0;
         
         const orderedTypes = ['rail', 'rail_yard', 'narrow_gauge', 'subway', 'light_rail', 'tram', 'construction', 'proposed', 'abandoned', 'platform'];
         const orderedContexts = ['tunnel', 'surface', 'bridge'];
-        const styleData = style;
-        const existingSources = new Set(Object.keys(styleData.sources || {}));
-        const existingLayers = new Set((styleData.layers || []).map(l => l.id));
+        const existingSources = new Set(Object.keys(currentStyle.sources || {}));
+        const existingLayers = new Set((currentStyle.layers || []).map(l => l.id));
         
         orderedTypes.forEach(railType => {
             orderedContexts.forEach(context => {
@@ -712,6 +678,7 @@
                         }
                     }, insertBeforeId || undefined);
                     existingLayers.add(layerId);
+                    ownLayerIds.add(layerId);
 
                     if (context === 'bridge') {
                         const detailPaint = buildBridgeDetailPaint(railStyle);
@@ -729,6 +696,7 @@
                                 }
                             }, insertBeforeId || undefined);
                             existingLayers.add(detailLayerId);
+                            ownLayerIds.add(detailLayerId);
                         }
                     }
                 } catch (e) {
@@ -765,6 +733,7 @@
                         layout: { 'visibility': showLabels ? 'visible' : 'none' },
                         minzoom: 12
                     }, insertBeforeId || undefined);
+                    ownLayerIds.add(dotsLayerId);
                 }
 
                 ensureStationTooltipHandlers(map, cityCode);
@@ -774,8 +743,9 @@
         }
 
         reorderRailwayLayers(map, cityCode);
-        
-        isLoading = false;
+        } finally {
+            isLoading = false;
+        }
     }
     
     function removeExistingLayers(cityCode) {
@@ -787,12 +757,15 @@
         
         console.log(`[Railway Overlay] Removing existing layers for ${cityCode}`);
         
-        const layersToRemove = [];
-        style.layers.forEach(layer => {
-            if (layer.id.includes(`railway-`) && layer.id.includes(`-${cityCode}-`)) {
-                layersToRemove.push(layer.id);
-            }
-        });
+        // Match both mid-string (-cityCode-) and suffix (-cityCode) patterns so station
+        // layers/sources (e.g. railway-station-dots-nyc) are included.
+        const matchesCityCode = (id) =>
+            id.startsWith('railway-') &&
+            (id.includes(`-${cityCode}-`) || id.endsWith(`-${cityCode}`));
+
+        const layersToRemove = style.layers
+            .map(l => l.id)
+            .filter(matchesCityCode);
         
         layersToRemove.forEach(layerId => {
             try {
@@ -800,12 +773,7 @@
             } catch (e) {}
         });
         
-        const sourcesToRemove = [];
-        Object.keys(style.sources).forEach(sourceId => {
-            if (sourceId.includes(`railway-`) && sourceId.includes(`-${cityCode}-`)) {
-                sourcesToRemove.push(sourceId);
-            }
-        });
+        const sourcesToRemove = Object.keys(style.sources).filter(matchesCityCode);
         
         sourcesToRemove.forEach(sourceId => {
             try {
@@ -854,8 +822,15 @@
         return parts.join(', ');
     }
 
+    // Reusable element for HTML-escaping — avoids allocating a new node on every tooltip render.
+    const _escapeEl = document.createElement('div');
+    function escapeHTML(str) {
+        _escapeEl.textContent = String(str);
+        return _escapeEl.innerHTML;
+    }
+
     function buildStationTooltipHTML(props) {
-        const name = props?.name || 'Unknown Station';
+        const name = escapeHTML(props?.name || 'Unknown Station');
         const operator = props?.operator || props?.network || null;
         const line = props?.line || props?.route_ref || props?.ref || null;
         const railwayType = props?.railway || props?.public_transport || null;
@@ -865,13 +840,13 @@
         ];
 
         if (operator) {
-            lines.push(`<div style="opacity:0.9; font-size:11px;">Operator: ${operator}</div>`);
+            lines.push(`<div style="opacity:0.9; font-size:11px;">Operator: ${escapeHTML(operator)}</div>`);
         }
         if (line) {
-            lines.push(`<div style="opacity:0.9; font-size:11px;">Line: ${line}</div>`);
+            lines.push(`<div style="opacity:0.9; font-size:11px;">Line: ${escapeHTML(line)}</div>`);
         }
         if (railwayType && !operator && !line) {
-            lines.push(`<div style="opacity:0.8; font-size:11px;">${railwayType}</div>`);
+            lines.push(`<div style="opacity:0.8; font-size:11px;">${escapeHTML(railwayType)}</div>`);
         }
 
         return `<div style="color:#e5e7eb;">${lines.join('')}</div>`;
@@ -936,58 +911,42 @@
         if (!style?.layers) return;
         const insertBeforeId = getLabelInsertId(style);
 
+        // Move in the correct z-order: tunnel < surface < bridge < station dots
+        // Only iterate IDs we actually added — no full style.layers scan.
         const orderedTypes = ['rail', 'rail_yard', 'narrow_gauge', 'subway', 'light_rail', 'tram', 'construction', 'proposed', 'abandoned', 'platform'];
         const orderedContexts = ['tunnel', 'surface', 'bridge'];
 
-        orderedTypes.forEach(railType => {
-            orderedContexts.forEach(context => {
-                const key = `${railType}_${context}`;
-                const layerId = `railway-layer-${cityCode}-${key}`;
-                if (map.getLayer(layerId)) {
-                    try {
-                        if (insertBeforeId) {
-                            map.moveLayer(layerId, insertBeforeId);
-                        } else {
-                            map.moveLayer(layerId);
-                        }
-                    } catch (e) {}
-                }
+        for (const railType of orderedTypes) {
+            for (const context of orderedContexts) {
+                const layerId = `railway-layer-${cityCode}-${railType}_${context}`;
+                if (!ownLayerIds.has(layerId)) continue;
+                try {
+                    map.moveLayer(layerId, insertBeforeId || undefined);
+                } catch (e) {}
 
                 if (context === 'bridge') {
                     const detailLayerId = `${layerId}-detail`;
-                    if (map.getLayer(detailLayerId)) {
-                        try {
-                            if (insertBeforeId) {
-                                map.moveLayer(detailLayerId, insertBeforeId);
-                            } else {
-                                map.moveLayer(detailLayerId);
-                            }
-                        } catch (e) {}
+                    if (ownLayerIds.has(detailLayerId)) {
+                        try { map.moveLayer(detailLayerId, insertBeforeId || undefined); } catch (e) {}
                     }
                 }
-            });
-        });
+            }
+        }
 
         const dotsLayerId = `railway-station-dots-${cityCode}`;
-        if (map.getLayer(dotsLayerId)) {
-            try {
-                if (insertBeforeId) {
-                    map.moveLayer(dotsLayerId, insertBeforeId);
-                } else {
-                    map.moveLayer(dotsLayerId);
-                }
-            } catch (e) {}
+        if (ownLayerIds.has(dotsLayerId)) {
+            try { map.moveLayer(dotsLayerId, insertBeforeId || undefined); } catch (e) {}
         }
     }
     
     async function reapplyLayers(map, data) {
         const { layerData, stations, cityCode } = data;
         
-        const layers = map.getStyle().layers;
         const insertBeforeId = getLabelInsertId(map.getStyle());
 
         await ensureRailwayTextures(map);
         
+        ownLayerIds.clear();
         const orderedTypes = ['rail', 'rail_yard', 'narrow_gauge', 'subway', 'light_rail', 'tram', 'construction', 'proposed', 'abandoned', 'platform'];
         const orderedContexts = ['tunnel', 'surface', 'bridge'];
         const styleData = map.getStyle();
@@ -1029,6 +988,7 @@
                             }
                         }, insertBeforeId || undefined);
                         existingLayers.add(layerId);
+                        ownLayerIds.add(layerId);
 
                         if (context === 'bridge') {
                             const detailPaint = buildBridgeDetailPaint(railStyle);
@@ -1046,6 +1006,7 @@
                                     }
                                 }, insertBeforeId || undefined);
                                 existingLayers.add(detailLayerId);
+                                ownLayerIds.add(detailLayerId);
                             }
                         }
                     }
@@ -1083,6 +1044,7 @@
                         layout: { 'visibility': showLabels ? 'visible' : 'none' },
                         minzoom: 12
                     }, insertBeforeId || undefined);
+                    ownLayerIds.add(dotsLayerId);
                 }
 
                 ensureStationTooltipHandlers(map, cityCode);
@@ -1096,15 +1058,14 @@
     }
     
     api.hooks.onTrackBuilt(() => {
+        if (isLoading || !overlayEnabled) return;
         if (lastLoadedData && lastLoadedData.cityCode === currentCity) {
             const map = api.utils.getMap();
-            const style = map?.getStyle();
-            if (map && style?.layers) {
-                const existingLayers = style.layers.filter(l => l.id.includes(`railway-layer-${currentCity}`));
-                if (existingLayers.length === 0) {
-                    console.log(`[Railway Overlay] 🔨 Layers removed during building, restoring...`);
-                    reapplyLayers(map, lastLoadedData);
-                }
+            if (!map) return;
+            const sampleId = lastLoadedData.sampleLayerId;
+            if (sampleId && !map.getLayer(sampleId)) {
+                console.log(`[Railway Overlay] 🔨 Layers removed during building, restoring...`);
+                reapplyLayers(map, lastLoadedData);
             }
         }
     });
@@ -1129,9 +1090,10 @@
                 const sampleId = lastLoadedData.sampleLayerId;
                 const sampleExists = sampleId ? !!map.getLayer(sampleId) : false;
                 if (!sampleExists) {
-                    const existingLayers = style.layers.filter(l => l.id.includes(`railway-layer-${currentCity}`));
-                    if (existingLayers.length > 0) {
-                        return;
+                    // Verify it's gone (not just a missing sampleId) by checking ownLayerIds
+                    if (ownLayerIds.size > 0) {
+                        const anyStillPresent = [...ownLayerIds].some(id => map.getLayer(id));
+                        if (anyStillPresent) return;
                     }
                     console.log(`[Railway Overlay] Style change detected, restoring layers for ${currentCity}`);
                     await reapplyLayers(map, lastLoadedData);
@@ -1155,38 +1117,32 @@
         map.on('style.load', scheduleGuard);
     }
     
-    function toggleOverlay(enabled) {
+    async function toggleOverlay(enabled) {
         overlayEnabled = enabled;
         if (!currentCity) return;
         const map = api.utils.getMap();
-        const style = map?.getStyle();
-        if (!map || !style?.layers) return;
+        if (!map) return;
         
-        style.layers.forEach(layer => {
-            if (layer.id.includes(`railway-layer-`)) {
-                try {
-                    map.setPaintProperty(layer.id, 'line-opacity', enabled ? 1.0 : 0);
-                } catch (e) {}
+        // When re-enabling, restore layers if they were removed while the overlay was disabled
+        if (enabled && lastLoadedData && lastLoadedData.cityCode === currentCity) {
+            const sampleId = lastLoadedData.sampleLayerId;
+            if (sampleId && !map.getLayer(sampleId)) {
+                await reapplyLayers(map, lastLoadedData);
+                return;
             }
-            if (layer.id.includes(`railway-station-dots-`)) {
-                try {
-                    map.setPaintProperty(layer.id, 'circle-opacity', (enabled && showLabels) ? 1.0 : 0);
-                    map.setPaintProperty(layer.id, 'circle-stroke-opacity', (enabled && showLabels) ? 1.0 : 0);
-                    map.setLayoutProperty(layer.id, 'visibility', (enabled && showLabels) ? 'visible' : 'none');
-                } catch (e) {}
-            }
-        });
+        }
         
-        if (!enabled) {
-            style.layers.forEach(layer => {
-                if (layer.id.includes(`railway-station-dots-`)) {
-                    try {
-                        map.setPaintProperty(layer.id, 'circle-opacity', 0);
-                        map.setPaintProperty(layer.id, 'circle-stroke-opacity', 0);
-                        map.setLayoutProperty(layer.id, 'visibility', 'none');
-                    } catch (e) {}
+        // Use the cached own-layer set — avoids scanning all style.layers (can be 100s of entries)
+        for (const id of ownLayerIds) {
+            try {
+                if (id.includes('railway-station-dots-')) {
+                    map.setPaintProperty(id, 'circle-opacity', (enabled && showLabels) ? 1.0 : 0);
+                    map.setPaintProperty(id, 'circle-stroke-opacity', (enabled && showLabels) ? 1.0 : 0);
+                    map.setLayoutProperty(id, 'visibility', (enabled && showLabels) ? 'visible' : 'none');
+                } else {
+                    map.setPaintProperty(id, 'line-opacity', enabled ? 1.0 : 0);
                 }
-            });
+            } catch (e) {}
         }
     }
     
@@ -1194,20 +1150,16 @@
         showLabels = enabled;
         if (!currentCity) return;
         const map = api.utils.getMap();
-        const style = map?.getStyle();
-        if (!map || !style?.layers) return;
+        if (!map || !overlayEnabled) return;
         
-        if (!overlayEnabled) return;
-        
-        style.layers.forEach(layer => {
-            if (layer.id.includes(`railway-station-dots-`)) {
-                try {
-                    map.setPaintProperty(layer.id, 'circle-opacity', enabled ? 1.0 : 0);
-                    map.setPaintProperty(layer.id, 'circle-stroke-opacity', enabled ? 1.0 : 0);
-                    map.setLayoutProperty(layer.id, 'visibility', enabled ? 'visible' : 'none');
-                } catch (e) {}
-            }
-        });
+        for (const id of ownLayerIds) {
+            if (!id.includes('railway-station-dots-')) continue;
+            try {
+                map.setPaintProperty(id, 'circle-opacity', enabled ? 1.0 : 0);
+                map.setPaintProperty(id, 'circle-stroke-opacity', enabled ? 1.0 : 0);
+                map.setLayoutProperty(id, 'visibility', enabled ? 'visible' : 'none');
+            } catch (e) {}
+        }
     }
     
     const { React, components, icons } = api.utils;
@@ -1240,18 +1192,17 @@
         const fileInputRef = React.useRef(null);
         
         React.useEffect(() => {
-            const checkData = () => {
-                if (!currentCity) {
-                    setHasData(false);
-                    return;
-                }
-                setHasData(!!window.RailwayData[currentCity]);
+            const onDataReady = () => setHasData(true);
+            const onDataCleared = () => setHasData(false);
+            window.addEventListener('railway-data-ready', onDataReady);
+            window.addEventListener('railway-data-cleared', onDataCleared);
+            // Sync initial state once
+            setHasData(!!(currentCity && window.RailwayData[currentCity]));
+            return () => {
+                window.removeEventListener('railway-data-ready', onDataReady);
+                window.removeEventListener('railway-data-cleared', onDataCleared);
             };
-            
-            checkData();
-            const interval = setInterval(checkData, 3000);
-            return () => clearInterval(interval);
-        }, [currentCity]);
+        }, []);
 
         React.useEffect(() => {
             const handler = (e) => {
@@ -1271,28 +1222,12 @@
                 setIsOpen(false);
             };
             
-            const observer = new MutationObserver(() => {
-                if (!isOpen) return;
-                // If another panel opens, close ours
-                const openPanels = document.querySelectorAll('.panel, .modal, .dialog');
-                for (const el of openPanels) {
-                    if (panelRef.current && panelRef.current.contains(el)) continue;
-                    // Close when a different panel is visible
-                    if (el && el.offsetParent !== null) {
-                        setIsOpen(false);
-                        break;
-                    }
-                }
-            });
-            
             setTimeout(() => {
                 document.addEventListener('mousedown', handleClickOutside);
-                observer.observe(document.body, { childList: true, subtree: true, attributes: true });
             }, 100);
             
             return () => {
                 document.removeEventListener('mousedown', handleClickOutside);
-                observer.disconnect();
             };
         }, [isOpen]);
         
@@ -1358,7 +1293,7 @@
             }
 
             window.RailwayData[currentCity] = json;
-            setHasData(true);
+            window.dispatchEvent(new Event('railway-data-ready'));
             api.ui.showNotification('Data imported successfully', 'success');
             await loadRailwayOverlay(currentCity, false);
         };
@@ -1776,6 +1711,8 @@ out geom;`),
             console.log(`[Railway Overlay] City changed from ${currentCity} to ${cityCode}`);
             removeExistingLayers(currentCity);
             lastLoadedData = null;
+            ownLayerIds.clear();
+            window.dispatchEvent(new Event('railway-data-cleared'));
         }
         
         currentCity = cityCode;
